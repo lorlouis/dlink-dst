@@ -1,0 +1,31 @@
+# dlink-dst.timer — runs dlink-dst.service at the two DST transitions.
+#
+# America/Montreal switches on the second Sunday of March and the first
+# Sunday of November. In OnCalendar, a weekday plus a day-of-month range is
+# an intersection, so "Sun *-03-08..14" is exactly the second Sunday of
+# March. (Verified with systemd-analyze: 2027-03-14, 2028-03-12, 2029-03-11;
+# Nov 2027-11-07, 2028-11-05, 2029-11-04.)
+#
+# The times sit just after the clock change: in March the clock jumps
+# 02:00 -> 03:00, so 02:00 never exists that day; in November it falls back
+# 02:00 -> 01:00, so 02:01 happens once. At both, the local clock has
+# already rolled and `dlink-dst auto` reads the new DST state.
+#
+# OnCalendar takes no timezone here, so the timer follows the host's local
+# time. The host must be in America/Montreal (or a zone with the same
+# transition rules).
+#
+# Persistent=true: a missed run (host asleep) fires once on wake; auto is
+# idempotent, so that is harmless.
+
+[Unit]
+Description=DST-transition sync for D-Link router
+
+[Timer]
+OnCalendar=Sun *-03-08..14 03:01:00
+OnCalendar=Sun *-11-01..07 02:01:00
+Persistent=true
+Unit=dlink-dst.service
+
+[Install]
+WantedBy=timers.target

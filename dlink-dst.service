@@ -1,0 +1,11 @@
+# dlink-dst.service — runs `dlink-dst auto` to sync the router's DST flag.
+# System unit, triggered by dlink-dst.timer. install.sh copies this to
+# /etc/systemd/system/ and fills in __DLINK_PASSWORD__.
+
+[Unit]
+Description=Sync D-Link router DST flag with local timezone
+
+[Service]
+Type=oneshot
+Environment=DLINK_PASSWORD=__DLINK_PASSWORD__
+ExecStart=/usr/local/bin/dlink-dst auto

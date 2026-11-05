@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""dlink-dst: set the DaylightSaving flag on a D-Link DIR-878 (FW 1.10).
+
+Talks to the router's HNAP1 SOAP API. Python 3 stdlib only. The admin
+password comes from the DLINK_PASSWORD env var, a TTY prompt, or stdin, and
+is never stored. A value is only written if it is already wrong.
+
+  dlink-dst status   show router time settings and local DST state
+  dlink-dst on       enable DaylightSaving
+  dlink-dst off      disable DaylightSaving
+  dlink-dst auto     set to match the local timezone's DST state
+
+The router has a fixed-offset timezone and a manual DST flag, so it does not
+follow DST on its own. 'auto' compares against the local timezone and only
+writes when the two disagree.
+"""
+
+import argparse
+import getpass
+import hashlib
+import hmac
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+ROUTER_IP = "192.168.0.1"
+USERNAME = "Admin"
+NS = "http://purenetworks.com/HNAP1/"
+NSMAP = {"hn": NS}
+TZ = "America/Montreal"
+
+
+def hmac_md5_hex(key: str, data: str) -> str:
+    return hmac.new(key.encode(), data.encode(), hashlib.md5).hexdigest()
+
+
+def make_action(method: str, params: dict | None = None) -> str:
+    inner = "".join(f"<{k}>{v}</{k}>" for k, v in (params or {}).items())
+    return f'<{method} xmlns="{NS}">{inner}</{method}>'
+
+
+def soap_post(url: str, method: str, action_body: str,
+              key: str, cookie: str | None = None) -> str:
+    """POST one HNAP1 action; return the response body (or an error string)."""
+    envelope = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+        f'<soap:Body>{action_body}</soap:Body></soap:Envelope>'
+    )
+    ts = str(int(time.time() * 1000) % 2000000000000)
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": f'"{NS}{method}"',
+        "HNAP_AUTH": f"{hmac_md5_hex(key, ts + f'\"{NS}{method}\"').upper()} {ts}",
+    }
+    if cookie:
+        headers["Cookie"] = f"uid={cookie}"
+    req = urllib.request.Request(url, data=envelope.encode(), method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.read().decode()
+    except Exception as e:
+        return f"__error__{e}"
+
+
+def login(url: str, password: str) -> tuple[str, str] | None:
+    """Two-step HNAP1 challenge-response login; return (key, cookie) or None."""
+    body = soap_post(url, "Login",
+                     make_action("Login", {"Action": "request", "Username": USERNAME,
+                                           "Captcha": ""}),
+                     "withoutloginkey")
+    try:
+        root = ET.fromstring(body)
+        challenge = root.findtext(".//hn:Challenge", default="", namespaces=NSMAP)
+        cookie = root.findtext(".//hn:Cookie", default="", namespaces=NSMAP)
+        public_key = root.findtext(".//hn:PublicKey", default="", namespaces=NSMAP)
+    except ET.ParseError:
+        sys.exit(f"ERROR: login request failed: {body[:200]}")
+    if not (challenge and cookie and public_key):
+        sys.exit(f"ERROR: missing login fields: {body[:200]}")
+
+    key = hmac_md5_hex(public_key + password, challenge).upper()
+    passwd = hmac_md5_hex(key, challenge).upper()
+    body = soap_post(url, "Login",
+                     make_action("Login", {"Action": "login", "Username": USERNAME,
+                                           "LoginPassword": passwd, "Captcha": ""}),
+                     key, cookie)
+    try:
+        result = ET.fromstring(body).findtext(".//hn:LoginResult", default="", namespaces=NSMAP)
+    except ET.ParseError:
+        sys.exit(f"ERROR: login parse failed: {body[:200]}")
+    if result != "OK":
+        sys.exit(f"ERROR: login rejected (result={result})")
+    return key, cookie
+
+
+def get_time(url, key, cookie) -> dict:
+    body = soap_post(url, "GetTimeSettings", make_action("GetTimeSettings"), key, cookie)
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        sys.exit(f"ERROR: GetTimeSettings parse failed: {body[:200]}")
+    if root.findtext(".//hn:GetTimeSettingsResult", default="", namespaces=NSMAP) != "OK":
+        sys.exit(f"ERROR: GetTimeSettings not OK: {body[:200]}")
+    return {e.tag.split("}")[-1]: (e.text or "").strip()
+            for e in root.iter() if e.text and e.text.strip() and "Result" not in e.tag}
+
+
+def set_time(url, key, cookie, ts: dict, dst: str) -> bool:
+    body = (f'<SetTimeSettings xmlns="{NS}">'
+            f'<TimeZone>{ts["TimeZone"]}</TimeZone>'
+            f'<DaylightSaving>{dst}</DaylightSaving>'
+            f'<NTP>{ts["NTP"]}</NTP>'
+            f'<NTPServer>{ts["NTPServer"]}</NTPServer></SetTimeSettings>')
+    resp = soap_post(url, "SetTimeSettings", body, key, cookie)
+    try:
+        return (ET.fromstring(resp).findtext(
+            ".//hn:SetTimeSettingsResult", default="", namespaces=NSMAP) == "OK")
+    except ET.ParseError:
+        sys.exit(f"ERROR: SetTimeSettings parse failed: {resp[:200]}")
+
+
+def local_dst_active() -> bool:
+    now = datetime.now(ZoneInfo(TZ))
+    return now.dst() is not None and now.dst().total_seconds() != 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Toggle DST on D-Link DIR-878")
+    ap.add_argument("command", choices=["status", "on", "off", "auto"])
+    ap.add_argument("--ip", default=ROUTER_IP)
+    args = ap.parse_args()
+    url = f"http://{args.ip}/HNAP1/"
+
+    password = os.environ.get("DLINK_PASSWORD")
+    if not password:
+        password = (getpass.getpass(f"Password for {USERNAME}@{args.ip}: ")
+                    if sys.stdin.isatty() else sys.stdin.readline().strip())
+    if not password:
+        sys.exit("ERROR: no password (set DLINK_PASSWORD, use a TTY, or pipe stdin)")
+
+    key, cookie = login(url, password)
+    ts = get_time(url, key, cookie)
+
+    if args.command == "status":
+        for k in ("CurrentDate", "CurrentTime", "TimeZone", "DaylightSaving",
+                  "NTP", "NTPServer"):
+            if k in ts:
+                print(f"  {k:16} = {ts[k]}")
+        print(f"  {'Local ('+TZ+')':16} = {'active' if local_dst_active() else 'not active'}")
+        return
+
+    target = "true" if (local_dst_active() if args.command == "auto"
+                        else args.command == "on") else "false"
+    if ts["DaylightSaving"] == target:
+        print(f"Already {target}; nothing to do.")
+        return
+
+    if not set_time(url, key, cookie, ts, target):
+        sys.exit("ERROR: SetTimeSettings failed.")
+    print(f"DaylightSaving set to {target}.")
+
+
+if __name__ == "__main__":
+    main()
