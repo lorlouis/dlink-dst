@@ -1,5 +1,5 @@
-#!/usr/bin/env sh
-# install.sh — install dlink-dst as a system-wide systemd service + timer.
+#!/usr/bin/env bash
+# install.sh: install dlink-dst as a system-wide systemd service and timer.
 #
 # Usage:
 #   ./install.sh                 # prompts for the router admin password
@@ -12,7 +12,7 @@
 
 set -eu
 
-SRC_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SRC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BIN=/usr/local/bin/dlink-dst
 UNIT_DIR=/etc/systemd/system
 

@@ -28,6 +28,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+if sys.version_info < (3, 10):
+    sys.exit("dlink-dst needs Python 3.10+")
+
 ROUTER_IP = "192.168.0.1"
 USERNAME = "Admin"
 NS = "http://purenetworks.com/HNAP1/"
@@ -46,7 +49,11 @@ def make_action(method: str, params: dict | None = None) -> str:
 
 def soap_post(url: str, method: str, action_body: str,
               key: str, cookie: str | None = None) -> str:
-    """POST one HNAP1 action; return the response body (or an error string)."""
+    """POST one HNAP1 action and return the response body.
+
+    Network failures return a "__error__..." string. Callers must not feed
+    that to an XML parser.
+    """
     envelope = (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
@@ -68,16 +75,22 @@ def soap_post(url: str, method: str, action_body: str,
             return resp.read().decode()
     except urllib.error.HTTPError as e:
         return e.read().decode()
-    except Exception as e:
-        return f"__error__{e}"
+    except (urllib.error.URLError, OSError) as e:
+        return f"__error__cannot reach router: {e}"
+
+
+def die_if_error(body: str) -> None:
+    if body.startswith("__error__"):
+        sys.exit(f"ERROR: {body[len('__error__'):]}")
 
 
 def login(url: str, password: str) -> tuple[str, str] | None:
-    """Two-step HNAP1 challenge-response login; return (key, cookie) or None."""
+    """Two-step HNAP1 challenge-response login. Returns (key, cookie)."""
     body = soap_post(url, "Login",
                      make_action("Login", {"Action": "request", "Username": USERNAME,
                                            "Captcha": ""}),
                      "withoutloginkey")
+    die_if_error(body)
     try:
         root = ET.fromstring(body)
         challenge = root.findtext(".//hn:Challenge", default="", namespaces=NSMAP)
@@ -94,6 +107,7 @@ def login(url: str, password: str) -> tuple[str, str] | None:
                      make_action("Login", {"Action": "login", "Username": USERNAME,
                                            "LoginPassword": passwd, "Captcha": ""}),
                      key, cookie)
+    die_if_error(body)
     try:
         result = ET.fromstring(body).findtext(".//hn:LoginResult", default="", namespaces=NSMAP)
     except ET.ParseError:
@@ -105,6 +119,7 @@ def login(url: str, password: str) -> tuple[str, str] | None:
 
 def get_time(url, key, cookie) -> dict:
     body = soap_post(url, "GetTimeSettings", make_action("GetTimeSettings"), key, cookie)
+    die_if_error(body)
     try:
         root = ET.fromstring(body)
     except ET.ParseError:
@@ -122,6 +137,7 @@ def set_time(url, key, cookie, ts: dict, dst: str) -> bool:
             f'<NTP>{ts["NTP"]}</NTP>'
             f'<NTPServer>{ts["NTPServer"]}</NTPServer></SetTimeSettings>')
     resp = soap_post(url, "SetTimeSettings", body, key, cookie)
+    die_if_error(resp)
     try:
         return (ET.fromstring(resp).findtext(
             ".//hn:SetTimeSettingsResult", default="", namespaces=NSMAP) == "OK")
@@ -162,7 +178,7 @@ def main() -> None:
     target = "true" if (local_dst_active() if args.command == "auto"
                         else args.command == "on") else "false"
     if ts["DaylightSaving"] == target:
-        print(f"Already {target}; nothing to do.")
+        print(f"Already {target}. No change needed.")
         return
 
     if not set_time(url, key, cookie, ts, target):

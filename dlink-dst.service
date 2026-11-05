@@ -1,4 +1,4 @@
-# dlink-dst.service — runs `dlink-dst auto` to sync the router's DST flag.
+# dlink-dst.service: runs `dlink-dst auto` to sync the router's DST flag.
 # System unit, triggered by dlink-dst.timer. install.sh copies this to
 # /etc/systemd/system/ and fills in __DLINK_PASSWORD__.
 
